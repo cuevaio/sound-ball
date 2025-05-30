@@ -1,16 +1,19 @@
 "use client"
 
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 
 export default function Component() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const asciiRef = useRef<HTMLDivElement>(null)
-  const animationRef = useRef<number>()
-  const audioContextRef = useRef<AudioContext>()
-  const analyserRef = useRef<AnalyserNode>()
-  const dataArrayRef = useRef<Uint8Array>()
-  const sourceRef = useRef<MediaStreamAudioSourceNode>()
-  const streamRef = useRef<MediaStream>()
+  const animationRef = useRef<number | undefined>(undefined)
+  const audioContextRef = useRef<AudioContext | undefined>(undefined)
+  const analyserRef = useRef<AnalyserNode | undefined>(undefined)
+  const dataArrayRef = useRef<Uint8Array | undefined>(undefined)
+  const audioRef = useRef<HTMLAudioElement | undefined>(undefined)
+  const sourceRef = useRef<MediaElementAudioSourceNode | undefined>(undefined)
+  const abortControllerRef = useRef<AbortController | undefined>(undefined)
+  const [text, setText] = useState("")
+  const [isGenerating, setIsGenerating] = useState(false)
 
   // ASCII characters from darkest to lightest
   const asciiChars = " .:-=+*#%@"
@@ -154,12 +157,14 @@ export default function Component() {
     if (analyserRef.current && dataArrayRef.current) {
       analyserRef.current.getByteFrequencyData(dataArrayRef.current)
 
+      // Calculate volume from frequency data
       const sum = dataArrayRef.current.reduce((a, b) => a + b, 0)
       volume = sum / dataArrayRef.current.length / 255
 
-      // Boost volume by 3x for all devices
-      volume = Math.min(1, volume * 3)
+      // Boost volume for better visualization
+      volume = Math.min(1, volume * 10) // Increased boost for better visibility
 
+      // Find dominant frequency
       let maxAmplitude = 0
       let maxIndex = 0
       for (let i = 0; i < dataArrayRef.current.length; i++) {
@@ -170,16 +175,17 @@ export default function Component() {
       }
       dominantFreq = maxIndex / dataArrayRef.current.length
 
-      ball.targetRadius = ball.baseRadius + volume * 120
+      // Update ball properties based on audio
+      ball.targetRadius = ball.baseRadius + volume * 150 // Increased radius change
       ball.targetHue = 200 + dominantFreq * 160
 
-      // Lower threshold for particle creation
+      // Create particles based on volume
       const particleThreshold = 0.05
       if (volume > particleThreshold) {
         addParticles(volume, canvas)
       }
     } else {
-      // Add subtle animation when no audio is available
+      // Subtle idle animation when no audio
       const time = Date.now() / 1000
       const pulseFactor = Math.sin(time) * 0.1 + 0.9
       ball.targetRadius = ball.baseRadius * pulseFactor
@@ -195,7 +201,6 @@ export default function Component() {
 
     // Draw ball with grayscale gradient
     const gradient = ctx.createRadialGradient(ball.x, ball.y, 0, ball.x, ball.y, ball.currentRadius)
-
     gradient.addColorStop(0, `rgba(255, 255, 255, 1)`)
     gradient.addColorStop(0.7, `rgba(180, 180, 180, 0.8)`)
     gradient.addColorStop(1, `rgba(80, 80, 80, 0.2)`)
@@ -248,9 +253,9 @@ export default function Component() {
 
         // Get amplitude with boost
         let amplitude = dataArrayRef.current[i * 4] / 255
-        amplitude = Math.min(1, amplitude * 3)
+        amplitude = Math.min(1, amplitude * 5) // Increased boost for TTS
 
-        const barLength = amplitude * 60
+        const barLength = amplitude * 80 // Increased bar length
 
         const startX = ball.x + Math.cos(angle) * (ball.currentRadius + 10)
         const startY = ball.y + Math.sin(angle) * (ball.currentRadius + 10)
@@ -277,6 +282,145 @@ export default function Component() {
     animationRef.current = requestAnimationFrame(animate)
   }
 
+  const initAudio = () => {
+    try {
+      // Create audio context with high sample rate for better quality
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 48000,
+      })
+
+      // Create analyzer with optimized settings for TTS
+      const analyser = audioContext.createAnalyser()
+      analyser.fftSize = 1024 // Increased for better frequency resolution
+      analyser.smoothingTimeConstant = 0.85 // Smoother transitions
+      analyser.minDecibels = -90 // Lower threshold for better sensitivity
+      analyser.maxDecibels = -10 // Higher threshold for better range
+
+      // Store references
+      audioContextRef.current = audioContext
+      analyserRef.current = analyser
+      dataArrayRef.current = new Uint8Array(analyser.frequencyBinCount)
+
+      console.log("Audio context initialized for TTS visualization")
+    } catch (err) {
+      console.error("Error initializing audio context:", err)
+    }
+  }
+
+  const handleTextToSpeech = async () => {
+    if (!text.trim() || isGenerating) return
+
+    setIsGenerating(true)
+    try {
+      // Initialize audio context if not already done
+      if (!audioContextRef.current) {
+        initAudio()
+      }
+
+      // Create a new AbortController for this request
+      abortControllerRef.current = new AbortController()
+
+      // Fetch the streaming audio
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text }),
+        signal: abortControllerRef.current.signal,
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to generate speech')
+      }
+
+      // Get the audio data as a blob
+      const audioBlob = await response.blob()
+      const audioUrl = URL.createObjectURL(audioBlob)
+
+      // Create audio element
+      const audio = new Audio(audioUrl)
+      audioRef.current = audio
+
+      // Create audio source and connect to analyzer
+      if (!audioContextRef.current || !analyserRef.current) {
+        throw new Error('Audio context not initialized')
+      }
+
+      // Disconnect any existing connections
+      if (sourceRef.current) {
+        sourceRef.current.disconnect()
+      }
+
+      // Create new source and connect it
+      const source = audioContextRef.current.createMediaElementSource(audio)
+      sourceRef.current = source
+
+      // Connect the audio graph
+      source.connect(analyserRef.current)
+      analyserRef.current.connect(audioContextRef.current.destination)
+
+      // Add gain node for better visualization
+      const gainNode = audioContextRef.current.createGain()
+      gainNode.gain.value = 2.0 // Boost the signal for better visualization
+      source.connect(gainNode)
+      gainNode.connect(analyserRef.current)
+
+      // Start playing the audio
+      try {
+        await audio.play()
+        console.log('Audio playback started')
+      } catch (playError) {
+        console.error('Error playing audio:', playError)
+        throw playError
+      }
+
+      // Clean up when audio ends
+      audio.onended = () => {
+        console.log('Audio playback ended')
+        URL.revokeObjectURL(audioUrl) // Clean up the URL
+        setIsGenerating(false)
+        abortControllerRef.current = undefined
+        audioRef.current = undefined
+        if (sourceRef.current) {
+          sourceRef.current.disconnect()
+          sourceRef.current = undefined
+        }
+      }
+
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Speech generation cancelled')
+      } else {
+        console.error('Error generating speech:', error)
+      }
+      setIsGenerating(false)
+      abortControllerRef.current = undefined
+      audioRef.current = undefined
+      if (sourceRef.current) {
+        sourceRef.current.disconnect()
+        sourceRef.current = undefined
+      }
+    }
+  }
+
+  const cancelGeneration = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = undefined
+    }
+    // Stop audio playback
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.currentTime = 0
+    }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect()
+      sourceRef.current = undefined
+    }
+    setIsGenerating(false)
+  }
+
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -289,53 +433,7 @@ export default function Component() {
     resizeCanvas()
     window.addEventListener("resize", resizeCanvas)
 
-    const initAudio = async () => {
-      try {
-        // Request microphone with optimized constraints for all devices
-        const constraints = {
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-            // Try to get the best possible audio quality
-            sampleRate: 48000,
-            channelCount: 1,
-            volume: 1.0,
-          },
-        }
-
-        const stream = await navigator.mediaDevices.getUserMedia(constraints)
-        streamRef.current = stream
-
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
-          // Higher sample rate for better quality
-          sampleRate: 48000,
-        })
-
-        const analyser = audioContext.createAnalyser()
-        const source = audioContext.createMediaStreamSource(stream)
-
-        // Adjust analyser settings for better sensitivity
-        analyser.fftSize = 256
-        analyser.smoothingTimeConstant = 0.5 // Less smoothing for more responsiveness
-
-        // Add gain to boost the signal for all devices
-        const gainNode = audioContext.createGain()
-        gainNode.gain.value = 3.0 // Boost the signal
-        source.connect(gainNode)
-        gainNode.connect(analyser)
-
-        audioContextRef.current = audioContext
-        analyserRef.current = analyser
-        sourceRef.current = source
-        dataArrayRef.current = new Uint8Array(analyser.frequencyBinCount)
-
-        console.log("Audio initialized with high sensitivity for all devices")
-      } catch (err) {
-        console.error("Error accessing microphone:", err)
-      }
-    }
-
+    // Initialize audio context
     initAudio()
 
     // Add a small delay to ensure canvas is properly sized before starting animation
@@ -348,9 +446,6 @@ export default function Component() {
       if (animationRef.current) {
         cancelAnimationFrame(animationRef.current)
       }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop())
-      }
       if (audioContextRef.current) {
         audioContextRef.current.close()
       }
@@ -359,6 +454,32 @@ export default function Component() {
 
   return (
     <div className="fixed inset-0 bg-black">
+      <div className="absolute top-4 left-4 right-4 z-10 flex gap-2">
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Enter text to convert to speech..."
+          className="flex-1 p-2 rounded bg-black/50 text-white border border-white/20 focus:border-white/50 outline-none resize-none"
+          rows={3}
+        />
+        <div className="flex gap-2">
+          <button
+            onClick={handleTextToSpeech}
+            disabled={isGenerating || !text.trim()}
+            className="px-4 py-2 rounded bg-white/10 text-white hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isGenerating ? 'Generating...' : 'Generate Speech'}
+          </button>
+          {isGenerating && (
+            <button
+              onClick={cancelGeneration}
+              className="px-4 py-2 rounded bg-red-500/20 text-red-400 hover:bg-red-500/30"
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      </div>
       <canvas ref={canvasRef} className="w-full h-full opacity-0" />
       <div
         ref={asciiRef}
@@ -366,7 +487,7 @@ export default function Component() {
         style={{
           fontSize: "5px",
           lineHeight: "5px",
-          letterSpacing: "-0.5px", // Added negative letter spacing to make characters less wide
+          letterSpacing: "-0.5px",
         }}
       />
     </div>
